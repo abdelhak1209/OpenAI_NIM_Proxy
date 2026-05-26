@@ -6,21 +6,15 @@ const axios = require('axios');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Middleware
 app.use(cors());
 app.use(express.json());
 
-// NVIDIA NIM API configuration
 const NIM_API_BASE = process.env.NIM_API_BASE || 'https://integrate.api.nvidia.com/v1';
 const NIM_API_KEY = process.env.NIM_API_KEY;
 
-// 🔥 REASONING DISPLAY TOGGLE - Shows/hides reasoning in output
-const SHOW_REASONING = false; // Set to true to show reasoning with <think> tags
+const SHOW_REASONING = false;    // true = show <think> blocks
+const ENABLE_THINKING_MODE = false; // true = send thinking param to model
 
-// 🔥 THINKING MODE TOGGLE - Enables thinking for specific models that support it
-const ENABLE_THINKING_MODE = false; // Set to true to enable chat_template_kwargs thinking parameter
-
-// Model mapping (adjust based on available NIM models)
 const MODEL_MAPPING = {
   'z-ai/glm-5.1': 'z-ai/glm-5.1',
   'minimaxai/minimax-m2.7': 'minimaxai/minimax-m2.7',
@@ -32,80 +26,39 @@ const MODEL_MAPPING = {
   'qwen/qwen3.5-397b-a17b': 'qwen/qwen3.5-397b-a17b'
 };
 
-// Health check endpoint
-app.get('/health', (req, res) => {
-  res.json({
-    status: 'ok',
-    service: 'OpenAI to NVIDIA NIM Proxy',
-    reasoning_display: SHOW_REASONING,
-    thinking_mode: ENABLE_THINKING_MODE
-  });
-});
+// Keep-alive endpoints for UptimeRobot
+app.get('/', (req, res) => res.json({ status: 'ok' }));
+app.get('/health', (req, res) => res.json({ status: 'ok', service: 'OpenAI to NVIDIA NIM Proxy' }));
 
-// Root endpoint - prevents 404 that breaks UptimeRobot keep-alive
-app.get('/', (req, res) => {
-  res.json({
-    status: 'ok',
-    service: 'OpenAI to NVIDIA NIM Proxy',
-    health: '/health',
-    models: '/v1/models'
-  });
-});
+// Models list (for Janitor AI model picker)
+app.get('/v1/models', (req, res) => res.json({
+  object: 'list',
+  data: Object.keys(MODEL_MAPPING).map(id => ({
+    id, object: 'model', created: Date.now(), owned_by: 'nvidia-nim-proxy'
+  }))
+}));
 
-// List models endpoint (OpenAI compatible)
-app.get('/v1/models', (req, res) => {
-  const models = Object.keys(MODEL_MAPPING).map(model => ({
-    id: model,
-    object: 'model',
-    created: Date.now(),
-    owned_by: 'nvidia-nim-proxy'
-  }));
-
-  res.json({
-    object: 'list',
-    data: models
-  });
-});
-
-// Chat completions endpoint (main proxy)
+// Main proxy
 app.post('/v1/chat/completions', async (req, res) => {
   try {
     const { model, messages, temperature, max_tokens, stream } = req.body;
 
-    // FIX #3: Removed double-API-call probe. Use string-based fallback directly.
-    let nimModel = MODEL_MAPPING[model];
-    if (!nimModel) {
-      const modelLower = model.toLowerCase();
-      if (modelLower.includes('gpt-4') || modelLower.includes('claude-opus') || modelLower.includes('405b')) {
-        nimModel = 'meta/llama-3.1-405b-instruct';
-      } else if (modelLower.includes('claude') || modelLower.includes('gemini') || modelLower.includes('70b')) {
-        nimModel = 'meta/llama-3.1-70b-instruct';
-      } else {
-        nimModel = 'meta/llama-3.1-8b-instruct';
-      }
-    }
+    // Fall back to flash model if unrecognized
+    const nimModel = MODEL_MAPPING[model] || 'deepseek-ai/deepseek-v4-flash';
 
-    // Transform OpenAI request to NIM format
-    const nimRequest = {
+    const response = await axios.post(`${NIM_API_BASE}/chat/completions`, {
       model: nimModel,
-      messages: messages,
+      messages,
       temperature: temperature || 0.6,
       max_tokens: max_tokens || 9024,
-      extra_body: ENABLE_THINKING_MODE ? { chat_template_kwargs: { thinking: true } } : undefined,
+      ...(ENABLE_THINKING_MODE && { extra_body: { chat_template_kwargs: { thinking: true } } }),
       stream: stream || false
-    };
-
-    // Make request to NVIDIA NIM API
-    const response = await axios.post(`${NIM_API_BASE}/chat/completions`, nimRequest, {
-      headers: {
-        'Authorization': `Bearer ${NIM_API_KEY}`,
-        'Content-Type': 'application/json'
-      },
+    }, {
+      headers: { 'Authorization': `Bearer ${NIM_API_KEY}`, 'Content-Type': 'application/json' },
       responseType: stream ? 'stream' : 'json'
     });
 
     if (stream) {
-      // Handle streaming response
       res.setHeader('Content-Type', 'text/event-stream');
       res.setHeader('Cache-Control', 'no-cache');
       res.setHeader('Connection', 'keep-alive');
@@ -118,127 +71,67 @@ app.post('/v1/chat/completions', async (req, res) => {
         const lines = buffer.split('\n');
         buffer = lines.pop() || '';
 
-        lines.forEach(line => {
-          if (line.startsWith('data: ')) {
-            // FIX #4: Use '\n\n' to properly terminate SSE [DONE] event
-            if (line.includes('[DONE]')) {
-              res.write(line + '\n\n');
-              return;
-            }
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue;
+          if (line.includes('[DONE]')) { res.write(line + '\n\n'); continue; }
 
-            try {
-              const data = JSON.parse(line.slice(6));
-              if (data.choices?.[0]?.delta) {
-                const reasoning = data.choices[0].delta.reasoning_content;
-                const content = data.choices[0].delta.content;
+          try {
+            const data = JSON.parse(line.slice(6));
+            const delta = data.choices?.[0]?.delta;
 
-                if (SHOW_REASONING) {
-                  let combinedContent = '';
+            if (delta) {
+              const reasoning = delta.reasoning_content;
+              const content = delta.content;
+              delete delta.reasoning_content;
 
-                  if (reasoning && !reasoningStarted) {
-                    combinedContent = '<think>\n' + reasoning;
-                    reasoningStarted = true;
-                  } else if (reasoning) {
-                    combinedContent = reasoning;
-                  }
-
-                  if (content && reasoningStarted) {
-                    combinedContent += '</think>\n\n' + content;
-                    reasoningStarted = false;
-                  } else if (content) {
-                    combinedContent += content;
-                  }
-
-                  if (combinedContent) {
-                    data.choices[0].delta.content = combinedContent;
-                    delete data.choices[0].delta.reasoning_content;
-                  } else {
-                    // FIX #2: Skip chunks with no displayable content
-                    return;
-                  }
-                } else {
-                  // FIX #2: Skip chunks that have no content (e.g. reasoning-only chunks)
-                  // Previously these were written as "" which caused Janitor AI to stop streaming
-                  if (!content) return;
-
-                  data.choices[0].delta.content = content;
-                  delete data.choices[0].delta.reasoning_content;
-                }
+              if (SHOW_REASONING) {
+                let out = '';
+                if (reasoning && !reasoningStarted) { out = '<think>\n' + reasoning; reasoningStarted = true; }
+                else if (reasoning) { out = reasoning; }
+                if (content && reasoningStarted) { out += '</think>\n\n' + content; reasoningStarted = false; }
+                else if (content) { out += content; }
+                if (!out) continue;
+                delta.content = out;
+              } else {
+                if (!content) continue; // skip reasoning-only chunks
+                delta.content = content;
               }
-              res.write(`data: ${JSON.stringify(data)}\n\n`);
-            } catch (e) {
-              res.write(line + '\n\n');
             }
+
+            res.write(`data: ${JSON.stringify(data)}\n\n`);
+          } catch (e) {
+            res.write(line + '\n\n');
           }
-        });
+        }
       });
 
       response.data.on('end', () => res.end());
-      response.data.on('error', (err) => {
-        console.error('Stream error:', err);
-        res.end();
-      });
+      response.data.on('error', (err) => { console.error('Stream error:', err); res.end(); });
 
     } else {
-      // Transform NIM response to OpenAI format with reasoning
-      const openaiResponse = {
+      res.json({
         id: `chatcmpl-${Date.now()}`,
         object: 'chat.completion',
         created: Math.floor(Date.now() / 1000),
-        model: model,
+        model,
         choices: response.data.choices.map(choice => {
-          let fullContent = choice.message?.content || '';
-
-          if (SHOW_REASONING && choice.message?.reasoning_content) {
-            fullContent = '<think>\n' + choice.message.reasoning_content + '\n</think>\n\n' + fullContent;
-          }
-
-          return {
-            index: choice.index,
-            message: {
-              role: choice.message.role,
-              content: fullContent
-            },
-            finish_reason: choice.finish_reason
-          };
+          let content = choice.message?.content || '';
+          if (SHOW_REASONING && choice.message?.reasoning_content)
+            content = `<think>\n${choice.message.reasoning_content}\n</think>\n\n` + content;
+          return { index: choice.index, message: { role: choice.message.role, content }, finish_reason: choice.finish_reason };
         }),
-        usage: response.data.usage || {
-          prompt_tokens: 0,
-          completion_tokens: 0,
-          total_tokens: 0
-        }
-      };
-
-      res.json(openaiResponse);
+        usage: response.data.usage || { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
+      });
     }
 
   } catch (error) {
     console.error('Proxy error:', error.message);
-
     res.status(error.response?.status || 500).json({
-      error: {
-        message: error.message || 'Internal server error',
-        type: 'invalid_request_error',
-        code: error.response?.status || 500
-      }
+      error: { message: error.message || 'Internal server error', type: 'invalid_request_error', code: error.response?.status || 500 }
     });
   }
 });
 
-// Catch-all for unsupported endpoints
-app.all('*', (req, res) => {
-  res.status(404).json({
-    error: {
-      message: `Endpoint ${req.path} not found`,
-      type: 'invalid_request_error',
-      code: 404
-    }
-  });
-});
+app.all('*', (req, res) => res.status(404).json({ error: { message: `Endpoint ${req.path} not found` } }));
 
-app.listen(PORT, () => {
-  console.log(`OpenAI to NVIDIA NIM Proxy running on port ${PORT}`);
-  console.log(`Health check: http://localhost:${PORT}/health`);
-  console.log(`Reasoning display: ${SHOW_REASONING ? 'ENABLED' : 'DISABLED'}`);
-  console.log(`Thinking mode: ${ENABLE_THINKING_MODE ? 'ENABLED' : 'DISABLED'}`);
-});
+app.listen(PORT, () => console.log(`Proxy running on port ${PORT}`));
