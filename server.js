@@ -49,21 +49,3 @@ app.post('/v1/chat/completions', async (req, res) => {
 });
 
 app.listen(process.env.PORT || 3000);
-
-// Add this after app.listen(...)
-async function warmup() {
-  try {
-    await axios.post(`${NIM_API_BASE}/chat/completions`, {
-      model: 'deepseek-ai/deepseek-v4-flash',
-      messages: [{ role: 'user', content: 'hi' }],
-      max_tokens: 1,
-      stream: false
-    }, {
-      headers: { 'Authorization': `Bearer ${NIM_API_KEY}`, 'Content-Type': 'application/json' }
-    });
-    console.log('Warmup done');
-  } catch (e) {
-    console.log('Warmup failed:', e.message);
-  }
-}
-warmup();
