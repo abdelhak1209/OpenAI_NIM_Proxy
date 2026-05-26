@@ -24,11 +24,12 @@ const ENABLE_THINKING_MODE = false; // Set to true to enable chat_template_kwarg
 const MODEL_MAPPING = {
   'z-ai/glm-5.1': 'z-ai/glm-5.1',
   'minimaxai/minimax-m2.7': 'minimaxai/minimax-m2.7',
-  'gpt-4-turbo': 'moonshotai/kimi-k2-instruct-0905',
-  'gpt-4o': 'deepseek-ai/deepseek-v3.1',
-  'claude-3-opus': 'openai/gpt-oss-120b',
-  'claude-3-sonnet': 'openai/gpt-oss-20b',
-  'gemini-pro': 'qwen/qwen3-next-80b-a3b-thinking'
+  'moonshotai/kimi-k2.6': 'moonshotai/kimi-k2.6',
+  'deepseek-ai/deepseek-v4-pro': 'deepseek-ai/deepseek-v4-pro',
+  'deepseek-ai/deepseek-v4-flash': 'deepseek-ai/deepseek-v4-flash',
+  'stepfun-ai/step-3.5-flash': 'stepfun-ai/step-3.5-flash',
+  'qwen/qwen3-coder-480b-a35b-instruct': 'qwen/qwen3-coder-480b-a35b-instruct',
+  'qwen/qwen3.5-397b-a17b': 'qwen/qwen3.5-397b-a17b'
 };
 
 // Health check endpoint
